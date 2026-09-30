@@ -15,6 +15,15 @@ the hardware control path, so removing them does not weaken device integration.
 > BLE profile and the **ChameleonUltra** command protocol (both open); the
 > Proxmark3 engine is the GPL Iceman client. See `docs/`.
 
+## For contributors & AI agents
+
+Start with **[`CLAUDE.md`](./CLAUDE.md)** (or [`AGENTS.md`](./AGENTS.md)) — it has
+the requirements, architecture, build toolchain pins, and conventions. Detailed
+status, next steps, and decisions are in [`docs/progress.md`](./docs/progress.md).
+
+Prebuilt test APK (release, arm64, ~7MB, debug-signed, installable):
+[`dist/nfc_tool-mvp-arm64.apk`](./dist/nfc_tool-mvp-arm64.apk).
+
 ## Status
 
 MVP in progress. Working now (BLE path):
