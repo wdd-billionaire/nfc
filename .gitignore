@@ -18,3 +18,7 @@ app/web/
 
 # OS
 .DS_Store
+
+# Build output artifacts (APKs)
+dist/
+*.apk
