@@ -10,8 +10,11 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  flutter_blue_plus: ^1.34.5
-  permission_handler: ^11.3.1
+  # Pinned to versions whose Android modules hardcode compileSdk (do not rely on
+  # Flutter injecting flutter.compileSdkVersion into plugin projects, which the
+  # pinned Flutter 3.24.x toolchain does not do).
+  flutter_blue_plus: 1.32.12
+  permission_handler: 11.3.1
 
 dev_dependencies:
   flutter_test:
