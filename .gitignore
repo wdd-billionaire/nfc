@@ -1,0 +1,20 @@
+# Flutter / Dart
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/build/
+app/.packages
+app/pubspec.lock
+app/.idea/
+**/*.iml
+
+# Generated platform scaffolding (run `flutter create` locally)
+app/android/
+app/ios/
+app/linux/
+app/macos/
+app/windows/
+app/web/
+
+# OS
+.DS_Store
