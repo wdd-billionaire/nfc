@@ -2,11 +2,33 @@
 
 Living record of what's done, why, and what to do next. Newest context on top.
 
+## ⚠️ Protocol correction (important)
+
+Real-hardware testing revealed the target device's **Chameleon side speaks the
+ChameleonMini RevG/RevH ASCII command protocol, NOT the ChameleonUltra binary
+frame protocol** that `src/protocol/frame.dart` + `chameleon_client.dart`
+implement. The device's BLE name is `ChameleonRevH`; the stock app uses RevG
+commands (`CONFIG=ISO14443A_READER`, `GETUID`, `IDENTIFY`, `DUMP_MFU`,
+`DETECTION?`, `LEDRED=`, the full `CONFIG` card-type list, …). That is why every
+Ultra command timed out.
+
+- **Chameleon mode = RevG ASCII** → implemented in `src/protocol/revg_client.dart`
+  (line-based `CMD\r\n` → `CODE:TEXT` responses). This is what the UI now uses.
+- **Switch to PM3 = send the `REBOOTPM3` command.** The device reboots into PM3
+  mode and keeps the same BLE name (`ChameleonRevH`); it is one Nordic UART link
+  that carries either protocol depending on mode.
+- **PM3 mode = Proxmark3 serial protocol** (driven by the GPL Iceman client,
+  `libpm3.so` in the stock app) — still to implement (roadmap M4).
+- The Ultra code (`frame.dart`, `commands.dart`, `chameleon_client.dart`,
+  `test/frame_test.dart`) is kept for reference / a possible future Ultra device,
+  but is **not used** by this device.
+
 ## Status snapshot
 
 | Milestone | State |
 |-----------|-------|
-| M0 MVP (BLE connect, device info, mode switch, HF14A read) | **code complete, builds, NOT yet hardware-verified** |
+| BLE scan + connect | **working on real hardware** (ChameleonRevH) |
+| M0 MVP read (RevG ASCII) | **re-implemented after protocol correction; awaiting hardware retest** |
 | M1 MIFARE Classic (read/crack/write) | not started (next priority) |
 | M2 Emulation & slots | not started |
 | M3 LF (125 kHz) | not started |
@@ -17,14 +39,18 @@ debug-signed, installable). Rebuild it after code changes.
 
 ## Immediate next steps (do these first)
 
-1. **Hardware smoke test.** Install the APK, connect to the real device over BLE,
-   confirm: scan finds it → connects → device info populates (model/firmware/
-   mode/battery) → "Reader mode" → "Read HF" returns a card's UID/ATQA/SAK.
-   If any field is wrong, fix the parsing in `chameleon_client.dart`:
-   - `getBattery()` assumes `[voltage_hi, voltage_lo, percent]`; confirm layout.
-   - `getGitVersion()`/`getDeviceModel()` return raw bytes; map to real strings
-     once the device's actual responses are known.
-2. **M1 MIFARE Classic** (the core "解卡/写卡" ask). Implement, in order:
+1. **Hardware retest with the RevG client.** Connect → device info (VERSION?,
+   CONFIG?, MEMSIZE?) should populate → "Reader mode" (CONFIG=ISO14443A_READER)
+   → "Read card" (IDENTIFY + GETUID) with a card on the antenna. Read the `tx»`
+   / `rx<=` and `CMD -> [code] status` lines in the Log to confirm the exact
+   RevG response format, then tighten parsing in `revg_client.dart` /
+   `home_page.dart` (UID/ATQA/SAK fields, MF detection, DUMP via XMODEM).
+2. **M1 MIFARE Classic over RevG** (the core "解卡/写卡" ask). Likely path:
+   `CONFIG=ISO14443A_READER` → `IDENTIFY` → `MF_DETECTION_1K/4K` /
+   `DETECTION?` for nonce collection → key recovery → `DUMP`/`DUMP_MFU`
+   (XMODEM download) for full read; emulate by setting a card `CONFIG=` and
+   `UPLOAD` (XMODEM) of a dump. Implement XMODEM over the transport.
+   (The old Ultra-based M1 plan below is kept only if a true Ultra device shows up.)
    - `MF1_DETECT_SUPPORT` (2001), `MF1_DETECT_PRNG` (2002) — check attack viability.
    - Key check via `MF1_AUTH_ONE_KEY_BLOCK` (2007) against a dictionary.
    - Full read via `MF1_READ_ONE_BLOCK` (2008); write via `MF1_WRITE_ONE_BLOCK` (2009).

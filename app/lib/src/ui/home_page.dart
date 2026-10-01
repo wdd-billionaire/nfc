@@ -5,13 +5,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-import '../protocol/chameleon_client.dart';
-import '../protocol/commands.dart';
-import '../protocol/frame.dart';
-import '../protocol/models.dart';
+import '../protocol/revg_client.dart';
 import '../transport/ble_transport.dart';
 
-/// Single-screen MVP: scan → connect → read device info → HF-14A read.
+/// MVP screen for a ChameleonMini RevG / RevH device (the Chameleon side of the
+/// fused PM3+Chameleon hardware): scan → connect → device info → read a card.
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
@@ -26,11 +24,14 @@ class _HomePageState extends State<HomePage> {
   bool _scanning = false;
 
   BleTransport? _transport;
-  ChameleonClient? _client;
+  RevgClient? _client;
   String? _connectedName;
-  DeviceInfo _info = DeviceInfo();
+
+  String _fw = '?';
+  String _cfg = '?';
+  String _mem = '?';
+  List<String> _lastRead = [];
   final List<String> _log = [];
-  List<Hf14aTag> _tags = [];
 
   @override
   void dispose() {
@@ -41,14 +42,9 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
-  void _addLog(String s) {
-    setState(() => _log.insert(0, s));
-  }
+  void _addLog(String s) => setState(() => _log.insert(0, s));
 
   Future<bool> _ensurePermissions() async {
-    // Android 12+ (incl. 16): BLUETOOTH_SCAN + BLUETOOTH_CONNECT are what matter.
-    // With neverForLocation set, location is NOT required for scanning, so we
-    // request it best-effort for older Android but never block on it.
     final req = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
@@ -58,15 +54,11 @@ class _HomePageState extends State<HomePage> {
     final connect = req[Permission.bluetoothConnect];
     final loc = req[Permission.location];
     final ok = ((scan?.isGranted ?? false) && (connect?.isGranted ?? false)) ||
-        (loc?.isGranted ?? false); // older Android path
-    if (!ok) {
-      _addLog('Permissions: scan=$scan connect=$connect location=$loc');
-    }
+        (loc?.isGranted ?? false);
+    if (!ok) _addLog('Permissions: scan=$scan connect=$connect location=$loc');
     return ok;
   }
 
-  /// Likely one of our target devices (for highlighting only — we never filter
-  /// it out, because many devices do not advertise their 128-bit service UUID).
   static bool _isLikely(ScanResult r) {
     if (r.advertisementData.serviceUuids.contains(NusUuids.service)) return true;
     final n = (r.device.platformName.isNotEmpty
@@ -77,7 +69,9 @@ class _HomePageState extends State<HomePage> {
         n.contains('ultra') ||
         n.contains('pm3') ||
         n.contains('proxmark') ||
-        n.contains('mini');
+        n.contains('mini') ||
+        n.contains('revh') ||
+        n.contains('revg');
   }
 
   static String _displayName(ScanResult r) {
@@ -92,7 +86,6 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     _addLog('Scan tapped');
-    // Make sure the adapter is on (use the synchronous getter; .first can hang).
     try {
       final state = FlutterBluePlus.adapterStateNow;
       _addLog('Adapter: $state');
@@ -115,8 +108,6 @@ class _HomePageState extends State<HomePage> {
 
     _scanSub?.cancel();
     _scanSub = FlutterBluePlus.scanResults.listen((rs) {
-      // Show ALL devices (deduped, strongest signal first). We do NOT filter by
-      // advertised service: the device exposes Nordic UART only after connect.
       final byId = <String, ScanResult>{};
       for (final r in rs) {
         byId[r.device.remoteId.str] = r;
@@ -124,8 +115,8 @@ class _HomePageState extends State<HomePage> {
       final list = byId.values.toList()
         ..sort((a, b) {
           final la = _isLikely(a), lb = _isLikely(b);
-          if (la != lb) return la ? -1 : 1; // likely devices first
-          return b.rssi.compareTo(a.rssi); // then strongest signal
+          if (la != lb) return la ? -1 : 1;
+          return b.rssi.compareTo(a.rssi);
         });
       setState(() {
         _results
@@ -144,7 +135,6 @@ class _HomePageState extends State<HomePage> {
         timeout: const Duration(seconds: 15),
         androidScanMode: AndroidScanMode.lowLatency,
       );
-      _addLog('Scanning... (${_results.length} devices so far)');
     } catch (e) {
       _addLog('startScan failed: $e');
       if (mounted) setState(() => _scanning = false);
@@ -155,83 +145,56 @@ class _HomePageState extends State<HomePage> {
     await FlutterBluePlus.stopScan();
     final t = BleTransport(device, onLog: _addLog);
     try {
-      _addLog('Connecting to ${device.platformName}...');
+      _addLog('Connecting to ${_displayName0(device)}...');
       await t.connect();
-      final c = ChameleonClient(t);
+      final c = RevgClient(t, log: _addLog);
       setState(() {
         _transport = t;
         _client = c;
-        _connectedName = device.platformName.isEmpty
-            ? device.remoteId.str
-            : device.platformName;
+        _connectedName =
+            device.platformName.isEmpty ? device.remoteId.str : device.platformName;
       });
-      _addLog('Connected. Probing protocol...');
-      await _probe();
+      _addLog('Connected. Reading device info...');
+      await _refreshInfo();
     } catch (e) {
       _addLog('Connect failed: $e');
       await t.disconnect();
     }
   }
 
-  /// Send both a ChameleonUltra binary frame and a few Chameleon-Mini ASCII
-  /// commands, so the raw `rx<=` log reveals which protocol the device speaks.
-  Future<void> _probe() async {
-    final t = _transport;
-    if (t == null) return;
-    Future<void> send(String label, Uint8List bytes) async {
-      _addLog('— probe: $label');
-      try {
-        await t.write(bytes);
-      } catch (e) {
-        _addLog('tx err: $e');
-      }
-      await Future.delayed(const Duration(milliseconds: 900));
-    }
-
-    _addLog('=== PROBE START ===');
-    await send('Ultra GET_APP_VERSION',
-        ChameleonFrame(Cmd.getAppVersion, 0, Uint8List(0)).encode());
-    await send('ASCII VERSION?', Uint8List.fromList('VERSION?\r\n'.codeUnits));
-    await send('ASCII v', Uint8List.fromList('v\r\n'.codeUnits));
-    await send('ASCII VERSION? (LF)', Uint8List.fromList('VERSION?\n'.codeUnits));
-    _addLog('=== PROBE END — look at rx<= lines ===');
-  }
+  String _displayName0(BluetoothDevice d) =>
+      d.platformName.isEmpty ? d.remoteId.str : d.platformName;
 
   Future<void> _refreshInfo() async {
     final c = _client;
     if (c == null) return;
     try {
-      final model = await c.getDeviceModel();
-      final mode = await c.getDeviceMode();
-      final ver = await c.getGitVersion();
-      int mv = 0, pct = 0;
+      final fw = await c.version();
+      final cfg = await c.config();
+      String mem = '?';
       try {
-        (mv, pct) = await c.getBattery();
+        mem = await c.memSize();
       } catch (_) {}
       setState(() {
-        _info = DeviceInfo(
-          model: model,
-          mode: mode,
-          gitVersion: ver,
-          batteryMv: mv,
-          batteryPercent: pct,
-        );
+        _fw = fw.isEmpty ? '?' : fw;
+        _cfg = cfg.isEmpty ? '?' : cfg;
+        _mem = mem.isEmpty ? '?' : mem;
       });
-      _addLog('Info: model=$model mode=${_info.modeLabel} fw=$ver batt=$pct%');
+      _addLog('Info: fw=$_fw cfg=$_cfg mem=$_mem');
     } catch (e) {
       _addLog('Read info failed: $e');
     }
   }
 
-  Future<void> _setReader(bool reader) async {
+  Future<void> _readerMode() async {
     final c = _client;
     if (c == null) return;
     try {
-      await c.setReaderMode(reader);
-      _addLog('Switched to ${reader ? "Reader" : "Emulator"} mode');
+      final r = await c.readerMode();
+      _addLog('CONFIG=ISO14443A_READER -> $r');
       await _refreshInfo();
     } catch (e) {
-      _addLog('Mode switch failed: $e');
+      _addLog('Set reader mode failed: $e');
     }
   }
 
@@ -239,22 +202,53 @@ class _HomePageState extends State<HomePage> {
     final c = _client;
     if (c == null) return;
     try {
-      if (_info.mode != DeviceMode.reader) {
-        await c.setReaderMode(true);
+      // Ensure reader mode, then identify + get UID.
+      if (!_cfg.toUpperCase().contains('READER')) {
+        await c.readerMode();
         await _refreshInfo();
       }
-      final tags = await c.hf14aScan();
-      setState(() => _tags = tags);
-      if (tags.isEmpty) {
-        _addLog('No card in field');
-      } else {
-        for (final t in tags) {
-          _addLog('Card UID=${t.uidHex} SAK=${t.sakHex} (${t.guessedType})');
-        }
-      }
+      final ident = await c.identify();
+      final uid = await c.getUid();
+      final lines = <String>[
+        if (uid.isNotEmpty) 'UID: $uid',
+        ...ident.text,
+        if (ident.text.isEmpty && uid.isEmpty) '(${ident.status})',
+      ];
+      setState(() => _lastRead = lines);
+      _addLog('Read: ${lines.isEmpty ? ident.status : lines.join(" | ")}');
     } catch (e) {
       _addLog('Read failed: $e');
     }
+  }
+
+  Future<void> _rebootPm3() async {
+    final c = _client;
+    if (c == null) return;
+    try {
+      _addLog('Sending REBOOTPM3 (switch to Proxmark3 mode)...');
+      final r = await c.rebootToPm3();
+      _addLog('REBOOTPM3 -> $r');
+      _addLog('Device is switching to PM3 mode; it will drop the BLE link. '
+          'PM3-mode support is not implemented yet.');
+    } catch (e) {
+      // The device may reboot before replying — that is expected.
+      _addLog('REBOOTPM3 sent (no reply, device likely rebooting): $e');
+    }
+  }
+
+  Future<void> _probe() async {
+    final c = _client;
+    if (c == null) return;
+    _addLog('=== PROBE ===');
+    for (final cmd in ['VERSION?', 'CONFIG?', 'MEMSIZE?', 'RSSI?']) {
+      try {
+        final r = await c.send(cmd);
+        _addLog('$cmd -> $r');
+      } catch (e) {
+        _addLog('$cmd -> ERR $e');
+      }
+    }
+    _addLog('=== PROBE END ===');
   }
 
   Future<void> _disconnect() async {
@@ -264,8 +258,8 @@ class _HomePageState extends State<HomePage> {
       _client = null;
       _transport = null;
       _connectedName = null;
-      _info = DeviceInfo();
-      _tags = [];
+      _fw = _cfg = _mem = '?';
+      _lastRead = [];
     });
     _addLog('Disconnected');
   }
@@ -279,7 +273,8 @@ class _HomePageState extends State<HomePage> {
         actions: [
           if (connected)
             IconButton(
-                onPressed: _disconnect, icon: const Icon(Icons.bluetooth_disabled)),
+                onPressed: _disconnect,
+                icon: const Icon(Icons.bluetooth_disabled)),
         ],
       ),
       body: connected ? _buildConnected() : _buildScan(),
@@ -287,7 +282,7 @@ class _HomePageState extends State<HomePage> {
           ? FloatingActionButton.extended(
               onPressed: _readCard,
               icon: const Icon(Icons.nfc),
-              label: const Text('Read HF'))
+              label: const Text('Read card'))
           : FloatingActionButton.extended(
               onPressed: _scanning ? null : _startScan,
               icon: const Icon(Icons.bluetooth_searching),
@@ -329,9 +324,8 @@ class _HomePageState extends State<HomePage> {
                       _scanning
                           ? 'Scanning for BLE devices...'
                           : 'Tap Scan to list nearby BLE devices.\n'
-                              'All devices are shown (your device may not advertise '
-                              'a name) — pick yours by signal strength or the ★ '
-                              'badge, or power-cycle it so it is advertising.',
+                              'All devices are shown — pick yours by signal '
+                              'strength or the ★ badge.',
                       textAlign: TextAlign.center,
                     ),
                   ),
@@ -358,7 +352,60 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _logPanel({double maxHeight = 200}) {
+  Widget _buildConnected() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Card(
+          margin: const EdgeInsets.all(12),
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Firmware: $_fw'),
+                Text('Config: $_cfg'),
+                Text('Memory: $_mem'),
+                const SizedBox(height: 8),
+                Wrap(spacing: 8, runSpacing: 4, children: [
+                  FilledButton.tonal(
+                      onPressed: _readerMode,
+                      child: const Text('Reader mode')),
+                  OutlinedButton(
+                      onPressed: _refreshInfo, child: const Text('Refresh')),
+                  OutlinedButton(
+                      onPressed: _probe, child: const Text('Probe')),
+                  OutlinedButton(
+                      onPressed: _rebootPm3,
+                      child: const Text('Switch to PM3')),
+                ]),
+              ],
+            ),
+          ),
+        ),
+        if (_lastRead.isNotEmpty)
+          Card(
+            margin: const EdgeInsets.symmetric(horizontal: 12),
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Last read',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  ..._lastRead.map((l) => Text(l,
+                      style: const TextStyle(fontFamily: 'monospace'))),
+                ],
+              ),
+            ),
+          ),
+        Expanded(child: _logPanel()),
+      ],
+    );
+  }
+
+  Widget _logPanel({double maxHeight = double.infinity}) {
     return Container(
       width: double.infinity,
       constraints: BoxConstraints(maxHeight: maxHeight),
@@ -406,66 +453,6 @@ class _HomePageState extends State<HomePage> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildConnected() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Card(
-          margin: const EdgeInsets.all(12),
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Firmware: ${_info.gitVersion ?? "?"}   '
-                    'Model: ${_info.model ?? "?"}'),
-                Text('Mode: ${_info.modeLabel}   '
-                    'Battery: ${_info.batteryPercent ?? "?"}%'),
-                const SizedBox(height: 8),
-                Wrap(spacing: 8, children: [
-                  FilledButton.tonal(
-                      onPressed: () => _setReader(true),
-                      child: const Text('Reader mode')),
-                  FilledButton.tonal(
-                      onPressed: () => _setReader(false),
-                      child: const Text('Emulator mode')),
-                  OutlinedButton(
-                      onPressed: _refreshInfo, child: const Text('Refresh')),
-                  OutlinedButton(
-                      onPressed: _probe, child: const Text('Probe')),
-                ]),
-              ],
-            ),
-          ),
-        ),
-        if (_tags.isNotEmpty)
-          ..._tags.map((t) => ListTile(
-                leading: const Icon(Icons.credit_card),
-                title: Text('UID ${t.uidHex}'),
-                subtitle: Text(
-                    'ATQA ${t.atqaHex}  SAK ${t.sakHex}  ${t.guessedType}'),
-              )),
-        const Divider(),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 12),
-          child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text('Log', style: TextStyle(fontWeight: FontWeight.bold))),
-        ),
-        Expanded(
-          child: ListView.builder(
-            itemCount: _log.length,
-            itemBuilder: (_, i) => Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
-              child: Text(_log[i],
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
-            ),
-          ),
-        ),
-      ],
     );
   }
 }

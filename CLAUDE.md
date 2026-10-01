@@ -67,6 +67,16 @@ stay unchanged. The heavy PM3 attacks (hardnested, LF sniff) will come from
 compiling the GPL Proxmark3 client as `libpm3` (NDK) behind the same transport —
 see roadmap M4.
 
+## ⚠️ Protocol note (confirmed on real hardware)
+
+The target device's **Chameleon side speaks the ChameleonMini RevG/RevH ASCII
+command protocol** (BLE name `ChameleonRevH`), NOT the ChameleonUltra binary
+frames. Use `src/protocol/revg_client.dart` (line-based `CMD\r\n` → `CODE:TEXT`).
+Switching to **PM3 mode = send `REBOOTPM3`** (device reboots, same BLE link/name;
+PM3 serial protocol not yet implemented — roadmap M4). The Ultra files
+(`frame.dart`, `commands.dart`, `chameleon_client.dart`) are kept for reference
+only and are not used by this device. See `docs/progress.md` for details.
+
 ## Current status (M0 MVP — done)
 
 - CU data-frame codec, verified against the reference implementation + unit tests.
