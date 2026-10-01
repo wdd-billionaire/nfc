@@ -44,13 +44,23 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<bool> _ensurePermissions() async {
-    // Android 12+ needs BLUETOOTH_SCAN/CONNECT; older needs location.
-    final statuses = await [
+    // Android 12+ (incl. 16): BLUETOOTH_SCAN + BLUETOOTH_CONNECT are what matter.
+    // With neverForLocation set, location is NOT required for scanning, so we
+    // request it best-effort for older Android but never block on it.
+    final req = await [
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
+      Permission.location,
     ].request();
-    return statuses.values.every((s) => s.isGranted || s.isLimited);
+    final scan = req[Permission.bluetoothScan];
+    final connect = req[Permission.bluetoothConnect];
+    final loc = req[Permission.location];
+    final ok = ((scan?.isGranted ?? false) && (connect?.isGranted ?? false)) ||
+        (loc?.isGranted ?? false); // older Android path
+    if (!ok) {
+      _addLog('Permissions: scan=$scan connect=$connect location=$loc');
+    }
+    return ok;
   }
 
   /// Likely one of our target devices (for highlighting only — we never filter
@@ -79,16 +89,22 @@ class _HomePageState extends State<HomePage> {
       _addLog('Bluetooth permission denied');
       return;
     }
-    // Make sure the adapter is on.
+    _addLog('Scan tapped');
+    // Make sure the adapter is on (use the synchronous getter; .first can hang).
     try {
-      final state = await FlutterBluePlus.adapterState.first;
+      final state = FlutterBluePlus.adapterStateNow;
+      _addLog('Adapter: $state');
       if (state != BluetoothAdapterState.on) {
         _addLog('Bluetooth is off — turn it on');
         try {
           await FlutterBluePlus.turnOn();
-        } catch (_) {}
+        } catch (e) {
+          _addLog('turnOn failed: $e');
+        }
       }
-    } catch (_) {}
+    } catch (e) {
+      _addLog('Adapter check error: $e');
+    }
 
     setState(() {
       _results.clear();
@@ -254,36 +270,116 @@ class _HomePageState extends State<HomePage> {
   }
 
   Widget _buildScan() {
-    if (_results.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Text(
-            _scanning
-                ? 'Scanning for BLE devices...'
-                : 'Tap Scan to list nearby BLE devices.\n'
-                    'All devices are shown (your device may not advertise a name) — '
-                    'pick yours by signal strength or the ★ badge, '
-                    'or power-cycle it so it is advertising.',
-            textAlign: TextAlign.center,
+    return Column(
+      children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          child: Row(
+            children: [
+              if (_scanning)
+                const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+              else
+                const Icon(Icons.bluetooth, size: 16),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(_scanning
+                    ? 'Scanning...  ${_results.length} device(s)'
+                    : '${_results.length} device(s) found'),
+              ),
+            ],
           ),
         ),
-      );
-    }
-    return ListView.builder(
-      itemCount: _results.length,
-      itemBuilder: (_, i) {
-        final r = _results[i];
-        final likely = _isLikely(r);
-        return ListTile(
-          leading: Icon(likely ? Icons.star : Icons.memory,
-              color: likely ? Colors.amber[700] : null),
-          title: Text(_displayName(r)),
-          subtitle: Text('${r.device.remoteId.str}   rssi ${r.rssi} dBm'),
-          trailing: const Icon(Icons.chevron_right),
-          onTap: () => _connect(r.device),
-        );
-      },
+        Expanded(
+          child: _results.isEmpty
+              ? Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      _scanning
+                          ? 'Scanning for BLE devices...'
+                          : 'Tap Scan to list nearby BLE devices.\n'
+                              'All devices are shown (your device may not advertise '
+                              'a name) — pick yours by signal strength or the ★ '
+                              'badge, or power-cycle it so it is advertising.',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  itemCount: _results.length,
+                  itemBuilder: (_, i) {
+                    final r = _results[i];
+                    final likely = _isLikely(r);
+                    return ListTile(
+                      leading: Icon(likely ? Icons.star : Icons.memory,
+                          color: likely ? Colors.amber[700] : null),
+                      title: Text(_displayName(r)),
+                      subtitle:
+                          Text('${r.device.remoteId.str}   rssi ${r.rssi} dBm'),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => _connect(r.device),
+                    );
+                  },
+                ),
+        ),
+        _logPanel(maxHeight: 160),
+      ],
+    );
+  }
+
+  Widget _logPanel({double maxHeight = 200}) {
+    return Container(
+      width: double.infinity,
+      constraints: BoxConstraints(maxHeight: maxHeight),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: Theme.of(context).dividerColor)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 6, 12, 2),
+            child: Row(
+              children: [
+                const Text('Log', style: TextStyle(fontWeight: FontWeight.bold)),
+                const Spacer(),
+                if (_log.isNotEmpty)
+                  InkWell(
+                    onTap: () => setState(() => _log.clear()),
+                    child: const Padding(
+                      padding: EdgeInsets.all(4),
+                      child: Text('clear', style: TextStyle(fontSize: 12)),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          Flexible(
+            child: _log.isEmpty
+                ? const Padding(
+                    padding: EdgeInsets.fromLTRB(12, 0, 12, 8),
+                    child: Text('(empty)',
+                        style: TextStyle(fontSize: 12, color: Colors.grey)))
+                : ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: _log.length,
+                    itemBuilder: (_, i) => Padding(
+                      padding:
+                          const EdgeInsets.symmetric(horizontal: 12, vertical: 1),
+                      child: Text(_log[i],
+                          style: const TextStyle(
+                              fontFamily: 'monospace', fontSize: 11)),
+                    ),
+                  ),
+          ),
+        ],
+      ),
     );
   }
 
