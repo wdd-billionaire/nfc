@@ -98,6 +98,24 @@ the next agent doesn't repeat the dig:
 - NDK r27/r28 have no `platforms/` dir (normal since r23); the `CXX5101` warning
   about it is benign.
 
+## Session timeline (newest first)
+
+- **RevG protocol implemented.** Added `revg_client.dart`; UI reworked to RevG
+  (VERSION?/CONFIG?/MEMSIZE?, Reader mode, Read card = IDENTIFY+GETUID, Probe,
+  Switch-to-PM3 via REBOOTPM3). APK rebuilt. Awaiting hardware retest + Log.
+- **Root cause found (from stock APK):** Chameleon side = ChameleonMini RevG
+  ASCII command set (CONFIG=, GETUID, IDENTIFY, DUMP_MFU, …); PM3 switch =
+  `REBOOTPM3`. The Ultra binary protocol was wrong for this device.
+- **On hardware: connect works, all commands time out.** Device connects as
+  `ChameleonRevH`; Ultra frames (1033/1001) got no response → protocol mismatch.
+- **BLE diagnostics + probe added** (service/char dump, raw tx/rx hex) to
+  identify the protocol.
+- **Scan fixed.** Removed the advertised-service filter (devices don't advertise
+  the 128-bit UUID) and stopped blocking on location permission (Android 12+/16
+  with neverForLocation). Scan + connect now work.
+- **First build + delivery.** Toolchain pinned to Flutter 3.24.x / JDK 17 after
+  newer Flutter failed to build in-container; MVP APK built and published.
+
 ## Verification done
 
 - `flutter test` — 6/6 protocol tests pass (LRC, encode, roundtrip, chunk
