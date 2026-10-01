@@ -20,6 +20,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final List<ScanResult> _results = [];
   StreamSubscription<List<ScanResult>>? _scanSub;
+  StreamSubscription<bool>? _isScanningSub;
   bool _scanning = false;
 
   BleTransport? _transport;
@@ -32,6 +33,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _scanSub?.cancel();
+    _isScanningSub?.cancel();
     _client?.dispose();
     _transport?.disconnect();
     super.dispose();
@@ -51,30 +53,84 @@ class _HomePageState extends State<HomePage> {
     return statuses.values.every((s) => s.isGranted || s.isLimited);
   }
 
+  /// Likely one of our target devices (for highlighting only — we never filter
+  /// it out, because many devices do not advertise their 128-bit service UUID).
+  static bool _isLikely(ScanResult r) {
+    if (r.advertisementData.serviceUuids.contains(NusUuids.service)) return true;
+    final n = (r.device.platformName.isNotEmpty
+            ? r.device.platformName
+            : r.advertisementData.advName)
+        .toLowerCase();
+    return n.contains('chameleon') ||
+        n.contains('ultra') ||
+        n.contains('pm3') ||
+        n.contains('proxmark') ||
+        n.contains('mini');
+  }
+
+  static String _displayName(ScanResult r) {
+    if (r.device.platformName.isNotEmpty) return r.device.platformName;
+    if (r.advertisementData.advName.isNotEmpty) return r.advertisementData.advName;
+    return '(unnamed)';
+  }
+
   Future<void> _startScan() async {
     if (!await _ensurePermissions()) {
       _addLog('Bluetooth permission denied');
       return;
     }
+    // Make sure the adapter is on.
+    try {
+      final state = await FlutterBluePlus.adapterState.first;
+      if (state != BluetoothAdapterState.on) {
+        _addLog('Bluetooth is off — turn it on');
+        try {
+          await FlutterBluePlus.turnOn();
+        } catch (_) {}
+      }
+    } catch (_) {}
+
     setState(() {
       _results.clear();
       _scanning = true;
     });
+
     _scanSub?.cancel();
     _scanSub = FlutterBluePlus.scanResults.listen((rs) {
+      // Show ALL devices (deduped, strongest signal first). We do NOT filter by
+      // advertised service: the device exposes Nordic UART only after connect.
+      final byId = <String, ScanResult>{};
+      for (final r in rs) {
+        byId[r.device.remoteId.str] = r;
+      }
+      final list = byId.values.toList()
+        ..sort((a, b) {
+          final la = _isLikely(a), lb = _isLikely(b);
+          if (la != lb) return la ? -1 : 1; // likely devices first
+          return b.rssi.compareTo(a.rssi); // then strongest signal
+        });
       setState(() {
         _results
           ..clear()
-          ..addAll(rs.where((r) =>
-              r.advertisementData.serviceUuids.contains(NusUuids.service) ||
-              r.device.platformName.isNotEmpty));
+          ..addAll(list);
       });
+    }, onError: (e) => _addLog('Scan error: $e'));
+
+    _isScanningSub?.cancel();
+    _isScanningSub = FlutterBluePlus.isScanning.listen((s) {
+      if (mounted) setState(() => _scanning = s);
     });
-    await FlutterBluePlus.startScan(
-      withServices: [NusUuids.service],
-      timeout: const Duration(seconds: 8),
-    );
-    setState(() => _scanning = false);
+
+    try {
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 15),
+        androidScanMode: AndroidScanMode.lowLatency,
+      );
+      _addLog('Scanning... (${_results.length} devices so far)');
+    } catch (e) {
+      _addLog('startScan failed: $e');
+      if (mounted) setState(() => _scanning = false);
+    }
   }
 
   Future<void> _connect(BluetoothDevice device) async {
@@ -200,22 +256,31 @@ class _HomePageState extends State<HomePage> {
   Widget _buildScan() {
     if (_results.isEmpty) {
       return Center(
-        child: Text(_scanning
-            ? 'Scanning for BLE devices...'
-            : 'Tap Scan to find your device'),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Text(
+            _scanning
+                ? 'Scanning for BLE devices...'
+                : 'Tap Scan to list nearby BLE devices.\n'
+                    'All devices are shown (your device may not advertise a name) — '
+                    'pick yours by signal strength or the ★ badge, '
+                    'or power-cycle it so it is advertising.',
+            textAlign: TextAlign.center,
+          ),
+        ),
       );
     }
     return ListView.builder(
       itemCount: _results.length,
       itemBuilder: (_, i) {
         final r = _results[i];
-        final name = r.device.platformName.isEmpty
-            ? '(unnamed)'
-            : r.device.platformName;
+        final likely = _isLikely(r);
         return ListTile(
-          leading: const Icon(Icons.memory),
-          title: Text(name),
-          subtitle: Text('${r.device.remoteId.str}  rssi ${r.rssi}'),
+          leading: Icon(likely ? Icons.star : Icons.memory,
+              color: likely ? Colors.amber[700] : null),
+          title: Text(_displayName(r)),
+          subtitle: Text('${r.device.remoteId.str}   rssi ${r.rssi} dBm'),
+          trailing: const Icon(Icons.chevron_right),
           onTap: () => _connect(r.device),
         );
       },
