@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -6,6 +7,7 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../protocol/chameleon_client.dart';
 import '../protocol/commands.dart';
+import '../protocol/frame.dart';
 import '../protocol/models.dart';
 import '../transport/ble_transport.dart';
 
@@ -151,7 +153,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _connect(BluetoothDevice device) async {
     await FlutterBluePlus.stopScan();
-    final t = BleTransport(device);
+    final t = BleTransport(device, onLog: _addLog);
     try {
       _addLog('Connecting to ${device.platformName}...');
       await t.connect();
@@ -163,12 +165,36 @@ class _HomePageState extends State<HomePage> {
             ? device.remoteId.str
             : device.platformName;
       });
-      _addLog('Connected. Reading device info...');
-      await _refreshInfo();
+      _addLog('Connected. Probing protocol...');
+      await _probe();
     } catch (e) {
       _addLog('Connect failed: $e');
       await t.disconnect();
     }
+  }
+
+  /// Send both a ChameleonUltra binary frame and a few Chameleon-Mini ASCII
+  /// commands, so the raw `rx<=` log reveals which protocol the device speaks.
+  Future<void> _probe() async {
+    final t = _transport;
+    if (t == null) return;
+    Future<void> send(String label, Uint8List bytes) async {
+      _addLog('— probe: $label');
+      try {
+        await t.write(bytes);
+      } catch (e) {
+        _addLog('tx err: $e');
+      }
+      await Future.delayed(const Duration(milliseconds: 900));
+    }
+
+    _addLog('=== PROBE START ===');
+    await send('Ultra GET_APP_VERSION',
+        ChameleonFrame(Cmd.getAppVersion, 0, Uint8List(0)).encode());
+    await send('ASCII VERSION?', Uint8List.fromList('VERSION?\r\n'.codeUnits));
+    await send('ASCII v', Uint8List.fromList('v\r\n'.codeUnits));
+    await send('ASCII VERSION? (LF)', Uint8List.fromList('VERSION?\n'.codeUnits));
+    _addLog('=== PROBE END — look at rx<= lines ===');
   }
 
   Future<void> _refreshInfo() async {
@@ -408,6 +434,8 @@ class _HomePageState extends State<HomePage> {
                       child: const Text('Emulator mode')),
                   OutlinedButton(
                       onPressed: _refreshInfo, child: const Text('Refresh')),
+                  OutlinedButton(
+                      onPressed: _probe, child: const Text('Probe')),
                 ]),
               ],
             ),

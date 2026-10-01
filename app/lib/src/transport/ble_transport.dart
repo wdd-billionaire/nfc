@@ -5,8 +5,8 @@ import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
 import 'transport.dart';
 
-/// Nordic UART Service (NUS) — the BLE profile ChameleonUltra-class devices use.
-/// Confirmed against the target hardware's advertised service UUID.
+/// Nordic UART Service (NUS) — the BLE profile used by ChameleonUltra/
+/// Chameleon-class devices. Confirmed against the target hardware.
 class NusUuids {
   static final Guid service = Guid('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
   // RX: central writes to peripheral.
@@ -15,9 +15,19 @@ class NusUuids {
   static final Guid txNotify = Guid('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
 }
 
+String _hex(List<int> b) =>
+    b.map((e) => e.toRadixString(16).padLeft(2, '0')).join(' ');
+
 /// BLE implementation of [DeviceTransport] over Nordic UART.
+///
+/// Robust against non-standard characteristic UUIDs: it prefers the NUS write/
+/// notify characteristics but falls back to the first writable / notifying
+/// characteristic found. All I/O is logged via [onLog] for diagnosis.
 class BleTransport implements DeviceTransport {
   final BluetoothDevice device;
+
+  /// Diagnostic sink (service/characteristic dump, raw tx/rx hex).
+  void Function(String msg)? onLog;
 
   BluetoothCharacteristic? _rx;
   BluetoothCharacteristic? _tx;
@@ -27,7 +37,9 @@ class BleTransport implements DeviceTransport {
   int _mtu = 23;
   bool _connected = false;
 
-  BleTransport(this.device);
+  BleTransport(this.device, {this.onLog});
+
+  void _log(String s) => onLog?.call(s);
 
   @override
   Stream<Uint8List> get incoming => _incoming.stream;
@@ -35,7 +47,6 @@ class BleTransport implements DeviceTransport {
   @override
   bool get isConnected => _connected;
 
-  /// Payload we may put in a single write (ATT MTU minus 3-byte header).
   int get _chunkSize => (_mtu - 3).clamp(20, 512);
 
   Future<void> connect() async {
@@ -45,30 +56,49 @@ class BleTransport implements DeviceTransport {
 
     await device.connect(timeout: const Duration(seconds: 15));
 
-    // Larger MTU => fewer writes for long frames. Android only; iOS ignores.
     try {
       _mtu = await device.requestMtu(247);
+      _log('MTU=$_mtu');
     } catch (_) {
       _mtu = 23;
     }
 
     final services = await device.discoverServices();
-    final svc = services.firstWhere(
-      (s) => s.uuid == NusUuids.service,
-      orElse: () => throw StateError(
-          'Nordic UART service not found — is this the right device?'),
-    );
-    for (final c in svc.characteristics) {
-      if (c.uuid == NusUuids.rxWrite) _rx = c;
-      if (c.uuid == NusUuids.txNotify) _tx = c;
+
+    // Dump everything so we can see the real data path.
+    BluetoothCharacteristic? nusRx, nusTx, anyWrite, anyNotify;
+    for (final s in services) {
+      _log('svc ${s.uuid.str}');
+      for (final c in s.characteristics) {
+        final p = c.properties;
+        final flags = [
+          if (p.read) 'R',
+          if (p.write) 'W',
+          if (p.writeWithoutResponse) 'w',
+          if (p.notify) 'N',
+          if (p.indicate) 'I',
+        ].join();
+        _log('  chr ${c.uuid.str} [$flags]');
+        if (c.uuid == NusUuids.rxWrite) nusRx = c;
+        if (c.uuid == NusUuids.txNotify) nusTx = c;
+        if (anyWrite == null && (p.write || p.writeWithoutResponse)) anyWrite = c;
+        if (anyNotify == null && (p.notify || p.indicate)) anyNotify = c;
+      }
     }
+
+    _rx = nusRx ?? anyWrite;
+    _tx = nusTx ?? anyNotify;
     if (_rx == null || _tx == null) {
-      throw StateError('NUS RX/TX characteristics missing');
+      throw StateError('No writable / notifying characteristic found');
     }
+    _log('using rx(write)=${_rx!.uuid.str}  tx(notify)=${_tx!.uuid.str}');
 
     await _tx!.setNotifyValue(true);
     _txSub = _tx!.onValueReceived.listen((v) {
-      if (v.isNotEmpty) _incoming.add(Uint8List.fromList(v));
+      if (v.isNotEmpty) {
+        _log('rx<= ${_hex(v)}');
+        _incoming.add(Uint8List.fromList(v));
+      }
     });
     _connected = true;
   }
@@ -77,8 +107,10 @@ class BleTransport implements DeviceTransport {
   Future<void> write(Uint8List bytes) async {
     final rx = _rx;
     if (rx == null) throw StateError('not connected');
-    // Prefer write-without-response when supported (faster); fall back.
-    final wwr = rx.properties.writeWithoutResponse;
+    _log('tx=> ${_hex(bytes)}');
+    final wwr = rx.properties.writeWithoutResponse && !rx.properties.write
+        ? true
+        : rx.properties.writeWithoutResponse;
     for (int i = 0; i < bytes.length; i += _chunkSize) {
       final end = (i + _chunkSize < bytes.length) ? i + _chunkSize : bytes.length;
       await rx.write(bytes.sublist(i, end), withoutResponse: wwr);
